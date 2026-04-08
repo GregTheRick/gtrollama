@@ -1,9 +1,11 @@
 package launch
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,8 +13,10 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/cmd/internal/fileutil"
 	"github.com/ollama/ollama/envconfig"
+	modeltype "github.com/ollama/ollama/types/model"
 )
 
 // OpenCode implements Runner and Editor for OpenCode integration
@@ -133,6 +137,9 @@ func (o *OpenCode) Edit(modelList []string) error {
 		}
 	}
 
+	client := api.NewClient(envconfig.Host(), http.DefaultClient)
+	ctx := context.Background()
+
 	for _, model := range modelList {
 		if existing, ok := models[model].(map[string]any); ok {
 			// migrate existing models without _launch marker
@@ -150,6 +157,10 @@ func (o *OpenCode) Edit(modelList []string) error {
 					}
 				}
 			}
+			// Update reasoning capability for managed models
+			if isOllamaModel(existing) {
+				applyOpenCodeReasoning(ctx, client, model, existing)
+			}
 			continue
 		}
 		entry := map[string]any{
@@ -164,6 +175,7 @@ func (o *OpenCode) Edit(modelList []string) error {
 				}
 			}
 		}
+		applyOpenCodeReasoning(ctx, client, model, entry)
 		models[model] = entry
 	}
 
@@ -249,6 +261,57 @@ func (o *OpenCode) Models() []string {
 	keys := slices.Collect(maps.Keys(models))
 	slices.Sort(keys)
 	return keys
+}
+
+// applyOpenCodeReasoning detects thinking capability and sets reasoning config
+// on the model entry. When the model supports thinking, it sets "reasoning": true
+// and configures variants for the OpenCode TUI:
+//   - GPT-OSS: supports variable effort levels (low/medium/high) and defaults to
+//     medium via options. Thinking cannot be turned off.
+//   - Other models: only support on/off. Disables built-in low/medium/high variants
+//     and adds a "none" variant so users can toggle thinking off via Ctrl+T.
+//
+// When the model does not support thinking, it removes stale reasoning config.
+func applyOpenCodeReasoning(ctx context.Context, client *api.Client, modelName string, entry map[string]any) {
+	resp, err := client.Show(ctx, &api.ShowRequest{Model: modelName})
+	if err != nil {
+		return
+	}
+
+	if slices.Contains(resp.Capabilities, modeltype.CapabilityThinking) {
+		entry["reasoning"] = true
+
+		if strings.Contains(modelName, "gpt-oss") {
+			// GPT-OSS models support variable thinking effort levels
+			// and cannot turn thinking off. Keep the built-in
+			// low/medium/high variants as-is and default to medium.
+			options, ok := entry["options"].(map[string]any)
+			if !ok {
+				options = make(map[string]any)
+			}
+			options["reasoningEffort"] = "medium"
+			entry["options"] = options
+		} else {
+			// Most models only support thinking on or off.
+			// Disable the built-in low/medium/high variants and add none.
+			entry["variants"] = map[string]any{
+				"none":   map[string]any{"reasoningEffort": "none"},
+				"low":    map[string]any{"disabled": true},
+				"medium": map[string]any{"disabled": true},
+				"high":   map[string]any{"disabled": true},
+			}
+		}
+	} else {
+		delete(entry, "reasoning")
+		delete(entry, "variants")
+		// Clean up options.reasoningEffort if it was previously set
+		if options, ok := entry["options"].(map[string]any); ok {
+			delete(options, "reasoningEffort")
+			if len(options) == 0 {
+				delete(entry, "options")
+			}
+		}
+	}
 }
 
 // isOllamaModel reports whether a model config entry is managed by us
