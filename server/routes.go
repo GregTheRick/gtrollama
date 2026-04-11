@@ -438,6 +438,36 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 	}
 
 	prompt := req.Prompt
+	if req.Raw && req.RawRender && m.Config.Renderer == "gemma4" {
+		const placeholder = "<|image|>"
+		numImages := len(req.Images)
+		numPlaceholders := strings.Count(prompt, placeholder)
+
+		if numImages > numPlaceholders {
+			// Inject extra images at the beginning
+			extra := numImages - numPlaceholders
+			var prefix strings.Builder
+			for i := 0; i < extra; i++ {
+				fmt.Fprintf(&prefix, "[img-%d]", i)
+			}
+			prompt = prefix.String() + prompt
+
+			// Replace existing placeholders with remaining image tags
+			for i := extra; i < numImages; i++ {
+				prompt = strings.Replace(prompt, placeholder, fmt.Sprintf("[img-%d]", i), 1)
+			}
+		} else {
+			// Replace placeholders with images
+			for i := 0; i < numImages; i++ {
+				prompt = strings.Replace(prompt, placeholder, fmt.Sprintf("[img-%d]", i), 1)
+			}
+			// Remove extra placeholders from the end
+			if numPlaceholders > numImages {
+				prompt = strings.ReplaceAll(prompt, placeholder, "")
+			}
+		}
+	}
+
 	if !req.Raw {
 		tmpl := m.Template
 		if req.Template != "" {
