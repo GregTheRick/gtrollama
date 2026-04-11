@@ -86,6 +86,9 @@ type GenerateRequest struct {
 	// Raw set to true means that no formatting will be applied to the prompt.
 	Raw bool `json:"raw,omitempty"`
 
+	// RawRender set to true means that multimodal rendering will be applied to the prompt.
+	RawRender bool `json:"raw_render,omitempty"`
+
 	// Format specifies the format to return a response in.
 	Format json.RawMessage `json:"format,omitempty"`
 

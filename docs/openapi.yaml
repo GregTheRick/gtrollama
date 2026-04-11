@@ -104,6 +104,9 @@ components:
         raw:
           type: boolean
           description: When true, returns the raw response from the model without any prompt templating
+        raw_render:
+          type: boolean
+          description: When true and the model is Gemma 4, multimodal placeholders like `<|image|>` in a raw prompt will be expanded to reference attached images
         keep_alive:
           oneOf:
             - type: string
