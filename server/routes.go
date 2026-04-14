@@ -439,33 +439,44 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 
 	prompt := req.Prompt
 	if req.Raw && req.RawRender && m.Config.Renderer == "gemma4" {
-		const placeholder = "<|image|>"
+		const (
+			placeholder = "<|image|>"
+			userTurn    = "<|turn>user\n"
+		)
+
 		numImages := len(req.Images)
-		numPlaceholders := strings.Count(prompt, placeholder)
 
-		if numImages > numPlaceholders {
-			// Inject extra images at the beginning
-			extra := numImages - numPlaceholders
-			var prefix strings.Builder
-			for i := 0; i < extra; i++ {
-				fmt.Fprintf(&prefix, "[img-%d]", i)
-			}
-			prompt = prefix.String() + prompt
+		// 1. Replace placeholders in order until we run out of images or placeholders
+		imageIdx := 0
+		for imageIdx < numImages && strings.Contains(prompt, placeholder) {
+			prompt = strings.Replace(prompt, placeholder, fmt.Sprintf("[img-%d]", imageIdx), 1)
+			imageIdx++
+		}
 
-			// Replace existing placeholders with remaining image tags
-			for i := extra; i < numImages; i++ {
-				prompt = strings.Replace(prompt, placeholder, fmt.Sprintf("[img-%d]", i), 1)
+		// 2. If there are leftover images, inject them at the beginning of the last user turn
+		if imageIdx < numImages {
+			var extraTags strings.Builder
+			for ; imageIdx < numImages; imageIdx++ {
+				fmt.Fprintf(&extraTags, "\n\n[img-%d]\n\n", imageIdx)
 			}
-		} else {
-			// Replace placeholders with images
-			for i := 0; i < numImages; i++ {
-				prompt = strings.Replace(prompt, placeholder, fmt.Sprintf("[img-%d]", i), 1)
-			}
-			// Remove extra placeholders from the end
-			if numPlaceholders > numImages {
-				prompt = strings.ReplaceAll(prompt, placeholder, "")
+
+			lastTurnIdx := strings.LastIndex(prompt, userTurn)
+			if lastTurnIdx != -1 {
+				// Insert after the newline of the last user turn marker
+				insertPos := lastTurnIdx + len(userTurn)
+				prompt = prompt[:insertPos] + extraTags.String() + prompt[insertPos:]
+			} else {
+				// Fallback to appending if no turn marker is found
+				prompt = prompt + extraTags.String()
 			}
 		}
+
+		// 3. Remove any remaining placeholders if we have more placeholders than images
+		prompt = strings.ReplaceAll(prompt, placeholder, "")
+
+		// slog.Info("raw render complete", "prompt", prompt)
+	} else if req.Raw && len(req.Images) > 0 {
+		// slog.Info("raw mode with images but NO raw_render", "renderer", m.Config.Renderer, "numImages", len(req.Images))
 	}
 
 	if !req.Raw {
