@@ -127,8 +127,16 @@ type merge struct {
 }
 
 func (bpe BytePairEncoding) Encode(s string, addSpecial bool) ([]int32, error) {
+	return bpe.EncodeWithAllowed(s, addSpecial, nil)
+}
+
+func (bpe BytePairEncoding) EncodeWithAllowed(s string, addSpecial bool, allowed []string) ([]int32, error) {
 	fragments := []fragment{{value: s}}
 	for _, special := range bpe.vocab.SpecialVocabulary() {
+		if allowed != nil && !slices.Contains(allowed, special) {
+			continue
+		}
+
 		// TODO: process special tokens concurrently
 		id := bpe.vocab.Encode(special)
 		for i := 0; i < len(fragments); i++ {
@@ -138,15 +146,15 @@ func (bpe BytePairEncoding) Encode(s string, addSpecial bool) ([]int32, error) {
 			}
 
 			var middle []fragment
-			switch i := strings.Index(frag.value, special); {
-			case i < 0:
+			switch index := strings.Index(frag.value, special); {
+			case index < 0:
 				middle = append(middle, frag)
-			case i > 0:
-				middle = append(middle, fragment{value: frag.value[:i]})
+			case index > 0:
+				middle = append(middle, fragment{value: frag.value[:index]})
 				fallthrough
 			default:
 				middle = append(middle, fragment{value: special, ids: []int32{id}})
-				if rest := frag.value[i+len(special):]; rest != "" {
+				if rest := frag.value[index+len(special):]; rest != "" {
 					middle = append(middle, fragment{value: rest})
 				}
 			}

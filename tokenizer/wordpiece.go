@@ -98,6 +98,10 @@ func (wpm WordPiece) words(s string) iter.Seq[string] {
 
 // Encode implements Tokenizer.
 func (wpm WordPiece) Encode(s string, addSpecial bool) ([]int32, error) {
+	return wpm.EncodeWithAllowed(s, addSpecial, nil)
+}
+
+func (wpm WordPiece) EncodeWithAllowed(s string, addSpecial bool, allowed []string) ([]int32, error) {
 	var ids []int32
 
 	// TODO: use [UNK] from config

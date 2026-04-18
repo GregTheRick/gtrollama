@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -53,8 +54,16 @@ func (spm SentencePiece) Is(id int32, special Special) bool {
 }
 
 func (spm SentencePiece) Encode(s string, addSpecial bool) ([]int32, error) {
+	return spm.EncodeWithAllowed(s, addSpecial, nil)
+}
+
+func (spm SentencePiece) EncodeWithAllowed(s string, addSpecial bool, allowed []string) ([]int32, error) {
 	fragments := []fragment{{value: s}}
 	for _, special := range spm.vocab.SpecialVocabulary() {
+		if allowed != nil && !slices.Contains(allowed, special) {
+			continue
+		}
+
 		id := spm.vocab.Encode(special)
 		for i := 0; i < len(fragments); i++ {
 			frag := fragments[i]
@@ -63,15 +72,15 @@ func (spm SentencePiece) Encode(s string, addSpecial bool) ([]int32, error) {
 			}
 
 			var middle []fragment
-			switch i := strings.Index(frag.value, special); {
-			case i < 0:
+			switch index := strings.Index(frag.value, special); {
+			case index < 0:
 				middle = append(middle, frag)
-			case i > 0:
-				middle = append(middle, fragment{value: frag.value[:i]})
+			case index > 0:
+				middle = append(middle, fragment{value: frag.value[:index]})
 				fallthrough
 			default:
 				middle = append(middle, fragment{value: special, ids: []int32{id}})
-				if rest := frag.value[i+len(special):]; rest != "" {
+				if rest := frag.value[index+len(special):]; rest != "" {
 					middle = append(middle, fragment{value: rest})
 				}
 			}
