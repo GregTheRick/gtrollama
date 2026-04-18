@@ -69,7 +69,12 @@ func New(c fs.Config) (model.Model, error) {
 		),
 	}
 
-	vocabulary.EOS = append(vocabulary.EOS, int32(c.Uint("tokenizer.ggml.eot_token_id", 106)))
+	// Add End-of-Turn (106) and Tool-Response (50) as stop signals.
+	// These are required by the Gemma 4 specification for reliable chat and tool-calling.
+	vocabulary.EOS = append(vocabulary.EOS,
+		int32(c.Uint("tokenizer.ggml.eot_token_id", 106)),
+		int32(c.Uint("tokenizer.ggml.tool_response_token_id", 50)),
+	)
 
 	// Gemma 4 uses BPE with SentencePiece-style ▁ space markers (not GPT-2 byte-level encoding).
 	// The tokenizer.json has merges and a Replace normalizer (space → ▁), with no pre-tokenizer.
