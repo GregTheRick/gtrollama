@@ -1467,8 +1467,9 @@ type ImageData struct {
 }
 
 type CompletionRequest struct {
-	Prompt  string
-	Format  json.RawMessage
+	Prompt       string
+	PromptTokens []int
+	Format       json.RawMessage
 	Images  []ImageData
 	Options *api.Options
 

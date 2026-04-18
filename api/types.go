@@ -580,6 +580,84 @@ type Metrics struct {
 	EvalDuration       time.Duration `json:"eval_duration,omitempty"`
 }
 
+// GTRChatRequest describes a request for the /api/gtrchat endpoint.
+type GTRChatRequest struct {
+	Model      string         `json:"model"`
+	Turns      []GTRChatTurn  `json:"turns"`
+	Stream     *bool          `json:"stream,omitempty"`
+	StreamMode string         `json:"stream_mode,omitempty"` // "raw" or "structured"
+	Options    map[string]any `json:"options"`
+	KeepAlive  *Duration      `json:"keep_alive,omitempty"`
+}
+
+// GTRChatTurn represents a single turn in a GTR chat.
+type GTRChatTurn struct {
+	Role            string             `json:"role"`
+	ThinkingEnabled bool               `json:"thinking_enabled,omitempty"`
+	Components      []GTRChatComponent `json:"components"`
+}
+
+// GTRChatComponent represents a typed component within a turn.
+type GTRChatComponent struct {
+	CType string          `json:"ctype"`
+	Data  json.RawMessage `json:"data"`
+}
+
+// GTRTextData shape for systemtext, answer, thinking
+type GTRTextData struct {
+	Text string `json:"text"`
+}
+
+// GTRToolSchemaData shape for toolschema
+type GTRToolSchemaData struct {
+	Tools []GTRToolDefinition `json:"tools"`
+}
+
+type GTRToolDefinition struct {
+	Name        string           `json:"name"`
+	Description string           `json:"description,omitempty"`
+	Args        []GTRToolArgDesc `json:"args,omitempty"`
+}
+
+type GTRToolArgDesc struct {
+	Name        string `json:"name"`
+	ArgType     string `json:"arg_type"`
+	Description string `json:"description,omitempty"`
+}
+
+// GTRToolCallData shape for toolcall, toolresponse
+type GTRToolCallData struct {
+	Name string       `json:"name"`
+	Args []GTRToolArg `json:"args"`
+}
+
+type GTRToolArg struct {
+	Key string `json:"key"`
+	Val string `json:"val"`
+}
+
+// GTRMultimodalData shape for image, audio
+type GTRMultimodalData struct {
+	Multimodal string `json:"multimodal"` // base64
+}
+
+// GTRChatResponse is the non-streaming response for /api/gtrchat.
+type GTRChatResponse struct {
+	Model     string        `json:"model"`
+	CreatedAt time.Time     `json:"created_at"`
+	Turns     []GTRChatTurn `json:"turns"`
+	Done      bool          `json:"done"`
+	Metrics
+}
+
+// GTRChatResponseEvent is a single event streamed from /api/gtrchat in structured mode.
+type GTRChatResponseEvent struct {
+	Type    string `json:"type"`             // "thinking", "text", "tool_call_start", "tool_call_delta", "tool_call_end", "done"
+	Content string `json:"content,omitempty"`
+	Name    string `json:"name,omitempty"`    // for tool_call_start
+	Status  string `json:"status,omitempty"`  // for done: "complete" or "call_wait"
+}
+
 // Options specified in [GenerateRequest].  If you add a new option here, also
 // add it to the API docs.
 type Options struct {

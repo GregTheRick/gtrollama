@@ -129,10 +129,10 @@ type NewSequenceParams struct {
 
 var errorInputTooLong = errors.New("the input length exceeds the context length")
 
-func (s *Server) NewSequence(prompt string, images []llm.ImageData, params NewSequenceParams) (*Sequence, error) {
+func (s *Server) NewSequence(prompt string, promptTokens []int, images []llm.ImageData, params NewSequenceParams) (*Sequence, error) {
 	s.ready.Wait()
-
-	inputs, ctxs, mmStore, err := s.inputs(prompt, images)
+	
+	inputs, ctxs, mmStore, err := s.inputs(prompt, promptTokens, images)
 	if err != nil {
 		return nil, fmt.Errorf("failed to process inputs: %w", err)
 	} else if len(inputs) == 0 {
@@ -219,70 +219,110 @@ func calculateLogprobs(logits []float32, selectedToken int32, topK int, tok toke
 	return common.CalculateLogprobs(logits, int(selectedToken), topK, decoder)
 }
 
-// inputs processes the prompt and images into a list of inputs
-// by splitting the prompt on [img-<n>] tags, tokenizing text and
-// decoding images
-func (s *Server) inputs(prompt string, images []llm.ImageData) ([]*input.Input, []ml.Context, multimodalStore, error) {
+// inputs processes the prompt and images into a list of inputs.
+// If promptTokens is provided, it uses them directly, replacing the official image token
+// with modal embeddings. Otherwise, it splits the prompt string on [img-<n>] tags.
+func (s *Server) inputs(prompt string, promptTokens []int, images []llm.ImageData) ([]*input.Input, []ml.Context, multimodalStore, error) {
 	var inputs []*input.Input
 	var ctxs []ml.Context
 	var mmStore multimodalStore
-
-	var parts []string
-	var matches [][]string
-
+	
 	multimodalProcessor, visionModel := s.model.(model.MultimodalProcessor)
-
 	if visionModel {
-		re := regexp.MustCompile(`\[img-(\d+)\]`)
-		parts = re.Split(prompt, -1)
-		matches = re.FindAllStringSubmatch(prompt, -1)
 		mmStore = newMultimodalStore()
-	} else {
-		parts = []string{prompt}
 	}
 
-	for i, part := range parts {
-		// text - tokenize
-		tokens, err := s.model.(tokenizer.Tokenizer).Encode(part, i == 0)
-		if err != nil {
-			return nil, nil, nil, err
+	if visionModel && len(promptTokens) > 0 {
+		// Secure Token-level injection path (preferred for GTR)
+		// We look for the official image token ID in the model's vocabulary
+		var imageTokenID int32 = -1
+		tok := s.model.(tokenizer.Tokenizer)
+		for i := 0; i < 300000; i++ { // Typical vocab size
+			if tok.Is(int32(i), tokenizer.Special("<|image>")) || tok.Is(int32(i), tokenizer.Special("<|image|>")) {
+				imageTokenID = int32(i)
+				break
+			}
 		}
 
-		for _, t := range tokens {
-			inputs = append(inputs, &input.Input{Token: t})
-		}
-
-		// image - decode and store
-		if i < len(matches) {
-			n, _ := strconv.Atoi(matches[i][1])
-
-			imageIndex := -1
-			for j := range images {
-				if images[j].ID == n {
-					imageIndex = j
-					break
+		imgIdx := 0
+		for _, t := range promptTokens {
+			if int32(t) == imageTokenID && imgIdx < len(images) {
+				ctx := s.model.Backend().NewContext()
+				runtime.SetFinalizer(ctx, func(c ml.Context) { c.Close() })
+				ctxs = append(ctxs, ctx)
+				
+				imageEmbeddings, err := multimodalProcessor.EncodeMultimodal(ctx, images[imgIdx].Data)
+				if err != nil {
+					return nil, nil, nil, err
 				}
+				
+				s.multimodalHash.Reset()
+				_, _ = s.multimodalHash.Write(images[imgIdx].Data)
+				imageHash := s.multimodalHash.Sum64()
+				
+				mmStore.addMultimodal(imageEmbeddings)
+				inputs = append(inputs, &input.Input{Multimodal: imageEmbeddings, MultimodalHash: imageHash})
+				imgIdx++
+			} else {
+				inputs = append(inputs, &input.Input{Token: int32(t)})
 			}
-
-			if imageIndex < 0 {
-				return nil, nil, nil, fmt.Errorf("invalid image index: %d", n)
-			}
-
-			ctx := s.model.Backend().NewContext()
-			runtime.SetFinalizer(ctx, func(c ml.Context) { c.Close() })
-			ctxs = append(ctxs, ctx)
-			imageEmbeddings, err := multimodalProcessor.EncodeMultimodal(ctx, images[imageIndex].Data)
+		}
+	} else if visionModel {
+		// Legacy Regex string path
+		re := regexp.MustCompile(`\[img-(\d+)\]`)
+		parts := re.Split(prompt, -1)
+		matches := re.FindAllStringSubmatch(prompt, -1)
+		
+		for i, part := range parts {
+			// text - tokenize
+			tokens, err := s.model.(tokenizer.Tokenizer).Encode(part, i == 0)
 			if err != nil {
 				return nil, nil, nil, err
 			}
-
-			s.multimodalHash.Reset()
-			_, _ = s.multimodalHash.Write(images[imageIndex].Data)
-			imageHash := s.multimodalHash.Sum64()
-
-			mmStore.addMultimodal(imageEmbeddings)
-
-			inputs = append(inputs, &input.Input{Multimodal: imageEmbeddings, MultimodalHash: imageHash})
+			for _, t := range tokens {
+				inputs = append(inputs, &input.Input{Token: t})
+			}
+			
+			// image - decode and store
+			if i < len(matches) {
+				n, _ := strconv.Atoi(matches[i][1])
+				imageIndex := -1
+				for j := range images {
+					if images[j].ID == n {
+						imageIndex = j
+						break
+					}
+				}
+				
+				if imageIndex < 0 {
+					return nil, nil, nil, fmt.Errorf("invalid image index: %d", n)
+				}
+				
+				ctx := s.model.Backend().NewContext()
+				runtime.SetFinalizer(ctx, func(c ml.Context) { c.Close() })
+				ctxs = append(ctxs, ctx)
+				
+				imageEmbeddings, err := multimodalProcessor.EncodeMultimodal(ctx, images[imageIndex].Data)
+				if err != nil {
+					return nil, nil, nil, err
+				}
+				
+				s.multimodalHash.Reset()
+				_, _ = s.multimodalHash.Write(images[imageIndex].Data)
+				imageHash := s.multimodalHash.Sum64()
+				
+				mmStore.addMultimodal(imageEmbeddings)
+				inputs = append(inputs, &input.Input{Multimodal: imageEmbeddings, MultimodalHash: imageHash})
+			}
+		}
+	} else {
+		// Text-only path
+		tokens, err := s.model.(tokenizer.Tokenizer).Encode(prompt, true)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		for _, t := range tokens {
+			inputs = append(inputs, &input.Input{Token: t})
 		}
 	}
 
@@ -896,7 +936,7 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 		grammar,
 	)
 
-	seq, err := s.NewSequence(req.Prompt, req.Images, NewSequenceParams{
+	seq, err := s.NewSequence(req.Prompt, req.PromptTokens, req.Images, NewSequenceParams{
 		numPredict:  req.Options.NumPredict,
 		stop:        req.Options.Stop,
 		numKeep:     int32(req.Options.NumKeep),
@@ -1000,7 +1040,7 @@ func (s *Server) embeddings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	seq, err := s.NewSequence(req.Content, nil, NewSequenceParams{
+	seq, err := s.NewSequence(req.Content, nil, nil, NewSequenceParams{
 		embedding: true,
 		truncate:  false,
 	})
