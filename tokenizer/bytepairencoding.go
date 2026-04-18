@@ -195,10 +195,12 @@ func (bpe BytePairEncoding) EncodeWithAllowed(s string, addSpecial bool, allowed
 			}
 
 			// short circuit if the fragment is in the vocabulary
-			if id := bpe.vocab.Encode(normalized); id >= 0 {
+			// If the whole fragment (after normalization) is in the vocabulary, use it.
+			if id := bpe.vocab.EncodeWithAllowed(normalized, allowed); id >= 0 {
 				ids = append(ids, id)
 				continue
 			}
+
 
 			runes := []rune(normalized)
 			merges := make([]merge, len(runes))
@@ -271,7 +273,7 @@ func (bpe BytePairEncoding) EncodeWithAllowed(s string, addSpecial bool, allowed
 
 			for _, merge := range merges {
 				if len(merge.runes) > 0 {
-					if id := bpe.vocab.Encode(string(merge.runes)); id >= 0 {
+					if id := bpe.vocab.EncodeWithAllowed(string(merge.runes), allowed); id >= 0 {
 						ids = append(ids, id)
 					} else if bpe.spaceToSpmSep {
 						// SentencePiece byte fallback: encode each UTF-8 byte as <0xHH>

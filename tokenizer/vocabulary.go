@@ -80,6 +80,25 @@ func (v *Vocabulary) Encode(s string) int32 {
 	return -1
 }
 
+func (v *Vocabulary) EncodeWithAllowed(s string, allowed []string) int32 {
+	id := v.Encode(s)
+	if id < 0 {
+		return -1
+	}
+
+	// Safety check for partial vocabularies (common in unit tests)
+	if int(id) >= len(v.Types) {
+		return id
+	}
+
+	isSpecial := v.Types[id] == TOKEN_TYPE_CONTROL || v.Types[id] == TOKEN_TYPE_USER_DEFINED
+	if isSpecial && allowed != nil && !slices.Contains(allowed, s) {
+		return -1
+	}
+
+	return id
+}
+
 func (v *Vocabulary) Decode(id int32) string {
 	return v.Values[id]
 }

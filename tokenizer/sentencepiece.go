@@ -98,7 +98,7 @@ func (spm SentencePiece) EncodeWithAllowed(s string, addSpecial bool, allowed []
 
 		text := strings.ReplaceAll(frag.value, " ", spmWhitespaceSep)
 
-		if id := spm.vocab.Encode(text); id >= 0 {
+		if id := spm.vocab.EncodeWithAllowed(text, allowed); id >= 0 {
 			ids = append(ids, id)
 			continue
 		}

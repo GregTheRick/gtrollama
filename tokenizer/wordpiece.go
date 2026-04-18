@@ -122,7 +122,7 @@ func (wpm WordPiece) EncodeWithAllowed(s string, addSpecial bool, allowed []stri
 				if wpm.lowercase {
 					subword = strings.ToLower(subword)
 				}
-				piece = wpm.vocab.Encode(subword)
+				piece = wpm.vocab.EncodeWithAllowed(subword, allowed)
 				if piece >= 0 {
 					break
 				}
