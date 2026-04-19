@@ -24,13 +24,14 @@ type MockTokenizer struct {
 func NewMockTokenizer() *MockTokenizer {
 	return &MockTokenizer{
 		specials: map[string]int32{
-			"<|turn>":    2,
-			"<turn|>":    106,
-			"<|channel>": 46,
-			"<channel|>": 47,
-			"<|image|>":  258880,
-			"<|image>":   258880,
-			"<image|>":   258882,
+			"<|turn>":    301,
+			"<turn|>":    302,
+			"<|channel>": 303,
+			"<channel|>": 304,
+			"<|image|>":  305,
+			"<|image>":   305,
+			"<image|>":   306,
+			"<|\"|>":     307,
 		},
 	}
 }
@@ -104,7 +105,11 @@ func (m *MockTokenizer) Decode(tokens []int32) (string, error) {
 			}
 		}
 		if !matched {
-			sb.WriteString(fmt.Sprintf("[%d]", t))
+			if t >= 0 && t < 256 {
+				sb.WriteByte(byte(t))
+			} else {
+				sb.WriteString(fmt.Sprintf("[%d]", t))
+			}
 		}
 	}
 	return sb.String(), nil
@@ -477,4 +482,85 @@ func intSliceTo32(s []int) []int32 {
 		res[i] = int32(v)
 	}
 	return res
+}
+func TestToolCallParsingWithCommas(t *testing.T) {
+	tok := NewMockTokenizer()
+
+	parser := &GTRResponseParser{
+		tokenizer:   tok,
+		delimiterID: 307,
+	}
+
+	// Simulated tokens for: call:write{content:<|"|>Hello, world<|"|>,path:<|"|>test.txt<|"|>}
+	var tokens []int32
+	t1, _ := tok.Encode("call:write{content:", false)
+	tokens = append(tokens, t1...)
+	tokens = append(tokens, 307) // <|"|>
+	t2, _ := tok.Encode("Hello, world", false)
+	tokens = append(tokens, t2...)
+	tokens = append(tokens, 307) // <|"|>
+	t3, _ := tok.Encode(",path:", false)
+	tokens = append(tokens, t3...)
+	tokens = append(tokens, 307) // <|"|>
+	t4, _ := tok.Encode("test.txt", false)
+	tokens = append(tokens, t4...)
+	tokens = append(tokens, 307) // <|"|>
+	tokens = append(tokens, '}')
+
+	res := parser.parseGemma4ToolCallTokens(tokens)
+
+	if res.Name != "write" {
+		t.Errorf("expected name 'write', got '%s'", res.Name)
+	}
+
+	if len(res.Args) != 2 {
+		t.Fatalf("expected 2 args, got %d", len(res.Args))
+	}
+
+	if res.Args[0].Key != "content" || res.Args[0].Val != "Hello, world" {
+		t.Errorf("arg 0 mismatch: got %s=%s", res.Args[0].Key, res.Args[0].Val)
+	}
+
+	if res.Args[1].Key != "path" || res.Args[1].Val != "test.txt" {
+		t.Errorf("arg 1 mismatch: got %s=%s", res.Args[1].Key, res.Args[1].Val)
+	}
+}
+
+func TestToolCallParsingWithSpacedPunctuation(t *testing.T) {
+	tok := NewMockTokenizer()
+
+	parser := &GTRResponseParser{
+		tokenizer:   tok,
+		delimiterID: 307,
+	}
+
+	// Simulated tokens for: call:write { content : <|"|>Value<|"|> , path : <|"|>test.txt<|"|> }
+	// We use tokens that decode with spaces
+	var tokens []int32
+	t1, _ := tok.Encode("call:write { content", false)
+	tokens = append(tokens, t1...)
+	tokens = append(tokens, ':') // Imagine this decodes as " : " in real life, but here we trim
+	tokens = append(tokens, 307)
+	t2, _ := tok.Encode("Value", false)
+	tokens = append(tokens, t2...)
+	tokens = append(tokens, 307)
+	tokens = append(tokens, ',')
+	t3, _ := tok.Encode("path", false)
+	tokens = append(tokens, t3...)
+	tokens = append(tokens, ':')
+	tokens = append(tokens, 307)
+	t4, _ := tok.Encode("test.txt", false)
+	tokens = append(tokens, t4...)
+	tokens = append(tokens, 307)
+	tokens = append(tokens, '}')
+
+	res := parser.parseGemma4ToolCallTokens(tokens)
+
+	if res.Name != "write" {
+		t.Errorf("expected name 'write', got '%s'", res.Name)
+	}
+
+	if len(res.Args) != 2 {
+		t.Fatalf("expected 2 args, got %d", len(res.Args))
+	}
 }

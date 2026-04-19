@@ -614,15 +614,12 @@ type GTRToolSchemaData struct {
 }
 
 type GTRToolDefinition struct {
-	Name        string           `json:"name"`
-	Description string           `json:"description,omitempty"`
-	Args        []GTRToolArgDesc `json:"args,omitempty"`
-}
-
-type GTRToolArgDesc struct {
-	Name        string `json:"name"`
-	ArgType     string `json:"arg_type"`
-	Description string `json:"description,omitempty"`
+	Type     string `json:"type"`
+	Function struct {
+		Name        string                 `json:"name"`
+		Description string                 `json:"description,omitempty"`
+		Parameters  map[string]interface{} `json:"parameters,omitempty"`
+	} `json:"function"`
 }
 
 // GTRToolCallData shape for toolcall, toolresponse

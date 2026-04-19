@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -94,7 +95,11 @@ func (s *Server) GTRChatHandler(c *gin.Context) {
 		parser.thoughtEndIDs, _ = builder.tokenizer.Encode("<channel|>", false)
 		parser.toolStartIDs, _ = builder.tokenizer.Encode("<|tool_call>", false)
 		parser.toolEndIDs, _ = builder.tokenizer.Encode("<tool_call|>", false)
-		parser.delimiterID = vocab.Encode("<|\"|>")
+
+		delimiterIDs, _ := builder.tokenizer.Encode("<|\"|>", false)
+		if len(delimiterIDs) == 1 {
+			parser.delimiterID = delimiterIDs[0]
+		}
 
 		// If the direct vocabulary lookup for tool/thought start symbols
 		// returns a valid ID, we prioritize that atomic ID.
@@ -119,7 +124,7 @@ func (s *Server) GTRChatHandler(c *gin.Context) {
 		if opts.Stop == nil {
 			opts.Stop = []string{}
 		}
-		opts.Stop = append(opts.Stop, "<turn|>", "<eos>", "<|tool_response>")
+		//opts.Stop = append(opts.Stop, "<turn|>", "<eos>", "<|tool_response>")
 
 		err := r.Completion(c.Request.Context(), llm.CompletionRequest{
 			Prompt:       prompt,
@@ -206,7 +211,7 @@ func (p *GTRResponseParser) Parse(cr llm.CompletionResponse) {
 		return
 	}
 
-	if len(cr.TokenIDs) > 0 {
+	if len(cr.TokenIDs) > 0 && os.Getenv("OLLAMA_GTR_PROMPT_DEBUG") != "" {
 		slog.Debug("GTR Parser incoming tokens", "state", p.state, "ids", cr.TokenIDs, "buf_len", len(p.tokenBuffer))
 	}
 	for _, id := range cr.TokenIDs {
@@ -321,9 +326,8 @@ func (p *GTRResponseParser) emitTokens(tokens []int32) {
 }
 
 func (p *GTRResponseParser) emitToolCall(tokens []int32) {
-	content, _ := p.tokenizer.Decode(tokens)
-	slog.Debug("GTR Parser decoding tool call", "raw", content)
-	callData := parseGemma4ToolCall(content)
+	slog.Debug("GTR Parser processing tool call tokens", "count", len(tokens))
+	callData := p.parseGemma4ToolCallTokens(tokens)
 	p.onEvent(api.GTRChatResponseEvent{
 		Type:     "tool_call",
 		ToolCall: callData,
@@ -372,42 +376,69 @@ func (b *GTRPromptBuilder) Build(ctx context.Context, turns []api.GTRChatTurn) (
 
 	// Trigger Thinking Mode if requested.
 	// Per official spec, <|think|> must be at the start of the system prompt.
-	if thinking {
+	// We handle this by ensuring a system turn exists if thinking is enabled.
+	if thinking && (len(turns) == 0 || turns[0].Role != "system") {
 		t1, _ := b.tokenizer.Encode("<|turn>system\n<|think|><turn|>\n", false)
 		fullTokens = append(fullTokens, t1...)
+		thinking = false // Mark as handled
 	}
 
-	for i, turn := range turns {
+	for i := 0; i < len(turns); {
+		groupRole := turns[i].Role
+		effectiveRole := groupRole
+		if effectiveRole == "toolResult" {
+			effectiveRole = "model"
+		}
+
 		// Turn Start: <|turn>role\n
-		// To prevent shattering, we encode the structural marker atomically
-		t1, err := b.tokenizer.Encode("<|turn>", false)
+		tStart, err := b.tokenizer.Encode("<|turn>", false)
 		if err != nil {
 			return nil, nil, err
 		}
-		t2, err := b.tokenizer.Encode(turn.Role+"\n", false)
+		tRole, err := b.tokenizer.Encode(effectiveRole+"\n", false)
 		if err != nil {
 			return nil, nil, err
 		}
-		fullTokens = append(fullTokens, append(t1, t2...)...)
+		fullTokens = append(fullTokens, append(tStart, tRole...)...)
 
-		for _, comp := range turn.Components {
-			compTokens, err := b.encodeComponent(comp)
+		// Inject <|think|> at the start of the first system turn if pending
+		if effectiveRole == "system" && thinking {
+			tThink, err := b.tokenizer.Encode("<|think|>", false)
 			if err != nil {
 				return nil, nil, err
 			}
-			fullTokens = append(fullTokens, compTokens...)
+			fullTokens = append(fullTokens, tThink...)
+			thinking = false
 		}
 
-		// Turn End: <turn|>
-		// Note: The model turn usually doesn't have <turn|> if we are waiting for output,
-		// but the request might provide historical turns that DO have it.
-		// For the last turn, if it's a model turn, we skip <turn|> to allow continuation.
-		if i < len(turns)-1 || turn.Role != "model" {
-			tokens, err := b.tokenizer.Encode("<turn|>\n", false)
+		// Consolidate all components from consecutive turns that map to the same effective role
+		for i < len(turns) {
+			currentRole := turns[i].Role
+			if currentRole == "toolResult" {
+				currentRole = "model"
+			}
+			if currentRole != effectiveRole {
+				break
+			}
+
+			for _, comp := range turns[i].Components {
+				compTokens, err := b.encodeComponent(comp)
+				if err != nil {
+					return nil, nil, err
+				}
+				fullTokens = append(fullTokens, compTokens...)
+			}
+			i++
+		}
+
+		// Turn End: <turn|>\n
+		// Skip for the last turn if it's a model turn to allow continuation
+		if i < len(turns) || effectiveRole != "model" {
+			tEnd, err := b.tokenizer.Encode("<turn|>\n", false)
 			if err != nil {
 				return nil, nil, err
 			}
-			fullTokens = append(fullTokens, tokens...)
+			fullTokens = append(fullTokens, tEnd...)
 		}
 	}
 
@@ -422,6 +453,34 @@ func (b *GTRPromptBuilder) Build(ctx context.Context, turns []api.GTRChatTurn) (
 	for i, t := range fullTokens {
 		res[i] = int(t)
 	}
+
+	if os.Getenv("OLLAMA_GTR_PROMPT_DEBUG") != "" {
+		var out io.Writer = os.Stdout
+		logPath := os.Getenv("OLLAMA_GTR_PROMPT_DEBUG_FILE")
+		if logPath != "" {
+			f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err == nil {
+				defer f.Close()
+				out = f
+				fmt.Fprintf(out, "\n--- NEW REQUEST @ %s ---\n", time.Now().Format(time.RFC3339))
+			}
+		}
+
+		slog.Info("writing GTR request debug trace", "path", logPath)
+		rawReq, _ := json.MarshalIndent(turns, "", "  ")
+		fmt.Fprintf(out, "--- GTR REQUEST JSON START ---\n%s\n--- GTR REQUEST JSON END ---\n", string(rawReq))
+
+		slog.Info("writing GTR prompt debug trace", "path", logPath)
+		decoded, _ := b.tokenizer.Decode(fullTokens)
+		fmt.Fprintf(out, "--- GTR PROMPT START ---\n%s\n--- GTR PROMPT END ---\n", decoded)
+
+		fmt.Fprintf(out, "prompt_token_trace:\n")
+		for i, t := range fullTokens {
+			s, _ := b.tokenizer.Decode([]int32{t})
+			fmt.Fprintf(out, "%4d: %6d -> %q\n", i, t, s)
+		}
+	}
+
 	return res, b.images, nil
 }
 
@@ -536,9 +595,7 @@ func (b *GTRPromptBuilder) encodeComponent(comp api.GTRChatComponent) ([]int32, 
 		return []int32{258880}, nil
 
 	case "toolschema", "tool_schema":
-		var wrapper struct {
-			Tools []gemmaTool `json:"tools"`
-		}
+		var wrapper api.GTRToolSchemaData
 		if err := json.Unmarshal(comp.Data, &wrapper); err != nil {
 			return nil, err
 		}
@@ -561,16 +618,7 @@ func (b *GTRPromptBuilder) encodeComponent(comp api.GTRChatComponent) ([]int32, 
 	}
 }
 
-type gemmaTool struct {
-	Type     string `json:"type"`
-	Function struct {
-		Name        string                 `json:"name"`
-		Description string                 `json:"description"`
-		Parameters  map[string]interface{} `json:"parameters"`
-	} `json:"function"`
-}
-
-func formatGemmaFunctionDeclarationTokens(tok tokenizer.Tokenizer, tool gemmaTool) []int32 {
+func formatGemmaFunctionDeclarationTokens(tok tokenizer.Tokenizer, tool api.GTRToolDefinition) []int32 {
 	var tokens []int32
 
 	// declaration:name{
@@ -728,47 +776,80 @@ func formatGemmaParametersTokens(tok tokenizer.Tokenizer, props map[string]inter
 	return tokens
 }
 
-func parseGemma4ToolCall(s string) *api.GTRToolCallData {
+func (p *GTRResponseParser) parseGemma4ToolCallTokens(tokens []int32) *api.GTRToolCallData {
 	res := &api.GTRToolCallData{}
-	s = strings.TrimSpace(s)
+	if len(tokens) == 0 {
+		return res
+	}
 
-	// Gemma4 usually output starts with "call:name{"
-	// We'll look for the first colon and the first brace
-	colonIdx := strings.Index(s, ":")
-	braceIdx := strings.Index(s, "{")
-
-	if colonIdx != -1 && (braceIdx == -1 || colonIdx < braceIdx) {
-		// Verify if the prefix is indeed "call" (case-insensitive)
-		prefix := strings.ToLower(strings.TrimSpace(s[:colonIdx]))
-		if prefix == "call" {
-			s = s[colonIdx+1:]
-			braceIdx = strings.Index(s, "{")
+	// 1. Find the function name and the start of arguments '{'
+	braceIdx := -1
+	for i, t := range tokens {
+		s, _ := p.tokenizer.Decode([]int32{t})
+		if strings.Contains(s, "{") {
+			braceIdx = i
+			break
 		}
 	}
 
 	if braceIdx == -1 {
-		res.Name = strings.TrimSpace(s)
+		res.Name, _ = p.tokenizer.Decode(tokens)
+		res.Name = strings.TrimPrefix(strings.TrimSpace(res.Name), "call:")
 		return res
 	}
 
-	res.Name = strings.TrimSpace(s[:braceIdx])
-	argsStr := s[braceIdx+1:]
-	if strings.HasSuffix(argsStr, "}") {
-		argsStr = argsStr[:len(argsStr)-1]
+	nameStr, _ := p.tokenizer.Decode(tokens[:braceIdx])
+	res.Name = strings.TrimPrefix(strings.TrimSpace(nameStr), "call:")
+
+	// 2. Token-level scan for arguments
+	argTokens := tokens[braceIdx+1:]
+	var currentKey string
+	var currentValTokens []int32
+	inString := false
+
+	// Finding markers: ':' separates key/val, ',' separates pairs
+	// We use Decode on small slices to identify these delimiters safely
+	for i := 0; i < len(argTokens); i++ {
+		t := argTokens[i]
+
+		if t == p.delimiterID {
+			inString = !inString
+			continue
+		}
+
+		if !inString {
+			s, _ := p.tokenizer.Decode([]int32{t})
+			st := strings.TrimSpace(s)
+			if st == ":" && currentKey == "" {
+				// Finish key
+				keyStr, _ := p.tokenizer.Decode(currentValTokens)
+				currentKey = strings.TrimSpace(keyStr)
+				currentValTokens = nil
+				continue
+			}
+			if (st == "," || st == "}") && currentKey != "" {
+				// Finish value
+				valStr, _ := p.tokenizer.Decode(currentValTokens)
+				res.Args = append(res.Args, api.GTRToolArg{
+					Key: currentKey,
+					Val: strings.TrimSpace(valStr),
+				})
+				currentKey = ""
+				currentValTokens = nil
+				continue
+			}
+		}
+
+		currentValTokens = append(currentValTokens, t)
 	}
 
-	// Split by comma
-	parts := strings.Split(argsStr, ",")
-	for _, p := range parts {
-		kv := strings.SplitN(p, ":", 2)
-		if len(kv) == 2 {
-			k := strings.TrimSpace(kv[0])
-			v := kv[1]
-			// Clean up structural markers and quotes from value
-			v = strings.ReplaceAll(v, "<|\"|>", "")
-			v = strings.Trim(v, " \t\n\r\"'")
-			res.Args = append(res.Args, api.GTRToolArg{Key: k, Val: v})
-		}
+	// Final cleanup for unfinished args
+	if currentKey != "" {
+		valStr, _ := p.tokenizer.Decode(currentValTokens)
+		res.Args = append(res.Args, api.GTRToolArg{
+			Key: currentKey,
+			Val: strings.TrimSpace(valStr),
+		})
 	}
 
 	return res
