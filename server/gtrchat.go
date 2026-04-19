@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,6 +19,13 @@ import (
 	"github.com/ollama/ollama/tokenizer"
 	typemodel "github.com/ollama/ollama/types/model"
 )
+
+var AGENTIC_STRUCTURAL = []string{
+	"<|tool>", "<tool|>",
+	"<|tool_call>", "<tool_call|>",
+	"<|tool_response>", "<tool_response|>",
+	"<|\"|>",
+}
 
 func (s *Server) GTRChatHandler(c *gin.Context) {
 	var req api.GTRChatRequest
@@ -74,7 +82,44 @@ func (s *Server) GTRChatHandler(c *gin.Context) {
 			onEvent: func(event api.GTRChatResponseEvent) {
 				ch <- event
 			},
+			tokenizer:   builder.tokenizer,
+			delimiterID: -1,
 		}
+
+		// Initialize Control Token IDs using the vocabulary's direct encoding
+		// This ensures we get the atomic single ID for special symbols if available,
+		// avoiding subword fragmentation.
+		vocab := builder.tokenizer.Vocabulary()
+		parser.thoughtStartIDs, _ = builder.tokenizer.Encode("<|channel>thought\n", false)
+		parser.thoughtEndIDs, _ = builder.tokenizer.Encode("<channel|>", false)
+		parser.toolStartIDs, _ = builder.tokenizer.Encode("<|tool_call>", false)
+		parser.toolEndIDs, _ = builder.tokenizer.Encode("<tool_call|>", false)
+		parser.delimiterID = vocab.Encode("<|\"|>")
+
+		// If the direct vocabulary lookup for tool/thought start symbols
+		// returns a valid ID, we prioritize that atomic ID.
+		if id := vocab.Encode("<|channel>thought\n"); id != -1 {
+			parser.thoughtStartIDs = []int32{id}
+		}
+		if id := vocab.Encode("<channel|>"); id != -1 {
+			parser.thoughtEndIDs = []int32{id}
+		}
+		if id := vocab.Encode("<|tool_call>"); id != -1 {
+			parser.toolStartIDs = []int32{id}
+		}
+		if id := vocab.Encode("<tool_call|>"); id != -1 {
+			parser.toolEndIDs = []int32{id}
+		}
+
+		slog.Debug("GTR Parser initialized",
+			"thought_start", parser.thoughtStartIDs,
+			"tool_start", parser.toolStartIDs,
+			"delimiter", parser.delimiterID)
+
+		if opts.Stop == nil {
+			opts.Stop = []string{}
+		}
+		opts.Stop = append(opts.Stop, "<turn|>", "<eos>", "<|tool_response>")
 
 		err := r.Completion(c.Request.Context(), llm.CompletionRequest{
 			Prompt:       prompt,
@@ -95,7 +140,7 @@ func (s *Server) GTRChatHandler(c *gin.Context) {
 		var fullResponse api.GTRChatResponse
 		fullResponse.Model = req.Model
 		fullResponse.CreatedAt = time.Now().UTC()
-		
+
 		for e := range ch {
 			if ev, ok := e.(api.GTRChatResponseEvent); ok {
 				if ev.Type == "done" {
@@ -138,9 +183,18 @@ func (s *Server) streamResponse(c *gin.Context, ch <-chan any) {
 type GTRResponseParser struct {
 	streamMode string
 	onEvent    func(api.GTRChatResponseEvent)
-	
-	state      string // "", "thinking", "tool_call"
-	pending    string // buffer for partial markers
+	tokenizer  tokenizer.Tokenizer
+
+	state       string // "", "thinking", "tool_call"
+	tokenBuffer []int32
+
+	// Control Token IDs
+	thoughtStartIDs []int32 // <|channel>thought\n
+	thoughtEndIDs   []int32 // <channel|>
+	toolStartIDs    []int32 // <|tool_call>
+	toolEndIDs      []int32 // <tool_call|>
+	delimiterID     int32   // <|"|>
+	hadToolCall     bool
 }
 
 func (p *GTRResponseParser) Parse(cr llm.CompletionResponse) {
@@ -152,70 +206,58 @@ func (p *GTRResponseParser) Parse(cr llm.CompletionResponse) {
 		return
 	}
 
-	// Structured mode: State machine based on strings
-	// In a production environment, this would handle token-level transitions more robustly
-	p.pending += cr.Content
+	if len(cr.TokenIDs) > 0 {
+		slog.Debug("GTR Parser incoming tokens", "state", p.state, "ids", cr.TokenIDs, "buf_len", len(p.tokenBuffer))
+	}
+	for _, id := range cr.TokenIDs {
+		p.tokenBuffer = append(p.tokenBuffer, int32(id))
+	}
 
 	for {
 		found := false
-		
-		// 1. Check for thinking start
-		if idx := strings.Index(p.pending, "<|channel>thought\n"); idx != -1 {
-			if idx > 0 {
-				p.emit(p.pending[:idx])
-			}
-			p.state = "thinking"
-			p.pending = p.pending[idx+len("<|channel>thought\n"):]
-			found = true
-		}
-		
-		// 2. Check for thinking end
-		if idx := strings.Index(p.pending, "<channel|>"); idx != -1 {
-			if idx > 0 {
-				p.emit(p.pending[:idx])
-			}
-			p.state = ""
-			p.pending = p.pending[idx+len("<channel|>"):]
-			found = true
-		}
 
-		// 3. Check for tool call start
-		if idx := strings.Index(p.pending, "<|tool_call>"); idx != -1 {
-			if idx > 0 {
-				p.emit(p.pending[:idx])
-			}
-			p.pending = p.pending[idx+len("<|tool_call>"):]
-			p.state = "tool_call"
-			found = true
-		}
-
-		// 4. Check for tool call content (call:name{)
-		if p.state == "tool_call" && strings.Contains(p.pending, "call:") && strings.Contains(p.pending, "{") {
-			idxCall := strings.Index(p.pending, "call:")
-			idxBrace := strings.Index(p.pending, "{")
-			if idxBrace > idxCall {
-				name := p.pending[idxCall+len("call:") : idxBrace]
-				p.onEvent(api.GTRChatResponseEvent{Type: "tool_call_start", Name: name})
-				p.pending = p.pending[idxBrace+1:]
+		if p.state == "thinking" {
+			if idx := findSequence(p.tokenBuffer, p.thoughtEndIDs); idx != -1 {
+				if idx > 0 {
+					p.emitTokens(p.tokenBuffer[:idx])
+				}
+				p.state = ""
+				p.tokenBuffer = p.tokenBuffer[idx+len(p.thoughtEndIDs):]
 				found = true
 			}
-		}
-
-		// 5. Check for tool call end
-		if idx := strings.Index(p.pending, "<tool_call|>"); idx != -1 {
-			if idx > 0 {
-				p.emit(p.pending[:idx])
+		} else if p.state == "tool_call" {
+			if idx := findSequence(p.tokenBuffer, p.toolEndIDs); idx != -1 {
+				p.emitToolCall(p.tokenBuffer[:idx])
+				p.hadToolCall = true
+				p.state = ""
+				p.tokenBuffer = p.tokenBuffer[idx+len(p.toolEndIDs):]
+				found = true
 			}
-			p.onEvent(api.GTRChatResponseEvent{Type: "tool_call_end"})
-			p.state = ""
-			p.pending = p.pending[idx+len("<tool_call|>"):]
-			found = true
-		}
-
-		// 6. Check for turn end / tool response
-		if strings.Contains(p.pending, "<turn|>") || strings.Contains(p.pending, "<|tool_response>") {
-			// Stop processing and let 'Done' handle it
-			break
+		} else {
+			// Ground state: check for transitions or delimiters
+			if idx := findSequence(p.tokenBuffer, p.thoughtStartIDs); idx != -1 {
+				if idx > 0 {
+					p.emitTokens(p.tokenBuffer[:idx])
+				}
+				p.state = "thinking"
+				p.tokenBuffer = p.tokenBuffer[idx+len(p.thoughtStartIDs):]
+				found = true
+			} else if idx := findSequence(p.tokenBuffer, p.toolStartIDs); idx != -1 {
+				if idx > 0 {
+					p.emitTokens(p.tokenBuffer[:idx])
+				}
+				p.state = "tool_call"
+				p.tokenBuffer = p.tokenBuffer[idx+len(p.toolStartIDs):]
+				found = true
+			} else if p.delimiterID != -1 {
+				if idx := findID(p.tokenBuffer, p.delimiterID); idx != -1 {
+					if idx > 0 {
+						p.emitTokens(p.tokenBuffer[:idx])
+					}
+					p.tokenBuffer = p.tokenBuffer[idx+1:]
+					found = true
+				}
+			}
 		}
 
 		if !found {
@@ -223,37 +265,79 @@ func (p *GTRResponseParser) Parse(cr llm.CompletionResponse) {
 		}
 	}
 
-	// Emit whatever is left if it's not a partial marker
-	// We keep a small safety buffer for markers
-	if len(p.pending) > 20 {
-		safeLen := len(p.pending) - 20
-		p.emit(p.pending[:safeLen])
-		p.pending = p.pending[safeLen:]
+	// Safety emission for text/thought
+	if p.state != "tool_call" && len(p.tokenBuffer) > 5 {
+		safeLen := len(p.tokenBuffer) - 5
+		p.emitTokens(p.tokenBuffer[:safeLen])
+		p.tokenBuffer = p.tokenBuffer[safeLen:]
 	}
 
 	if cr.Done {
-		// Emit final pending
-		if p.pending != "" {
-			p.emit(p.pending)
+		if len(p.tokenBuffer) > 0 && p.state != "tool_call" {
+			p.emitTokens(p.tokenBuffer)
 		}
 		status := "complete"
-		if strings.Contains(cr.Content, "<|tool_response>") {
+		if p.hadToolCall {
 			status = "call_wait"
 		}
 		p.onEvent(api.GTRChatResponseEvent{Type: "done", Status: status})
 	}
 }
 
+func findSequence(buf, seq []int32) int {
+	if len(seq) == 0 {
+		return -1
+	}
+	for i := 0; i <= len(buf)-len(seq); i++ {
+		match := true
+		for j := 0; j < len(seq); j++ {
+			if buf[i+j] != seq[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+func findID(buf []int32, id int32) int {
+	for i, val := range buf {
+		if val == id {
+			return i
+		}
+	}
+	return -1
+}
+
+func (p *GTRResponseParser) emitTokens(tokens []int32) {
+	if len(tokens) == 0 {
+		return
+	}
+	content, _ := p.tokenizer.Decode(tokens)
+	p.emit(content)
+}
+
+func (p *GTRResponseParser) emitToolCall(tokens []int32) {
+	content, _ := p.tokenizer.Decode(tokens)
+	slog.Debug("GTR Parser decoding tool call", "raw", content)
+	callData := parseGemma4ToolCall(content)
+	p.onEvent(api.GTRChatResponseEvent{
+		Type:     "tool_call",
+		ToolCall: callData,
+	})
+}
+
 func (p *GTRResponseParser) emit(content string) {
-	if content == "" {
+	if content == "" || p.state == "tool_call" {
 		return
 	}
 	contentType := "text"
 	switch p.state {
 	case "thinking":
 		contentType = "thinking"
-	case "tool_call":
-		contentType = "tool_call_delta"
 	}
 	p.onEvent(api.GTRChatResponseEvent{Type: contentType, Content: content})
 }
@@ -274,14 +358,37 @@ func (s *Server) newGTRPromptBuilder(modelPath string) (*GTRPromptBuilder, error
 func (b *GTRPromptBuilder) Build(ctx context.Context, turns []api.GTRChatTurn) ([]int, []llm.ImageData, error) {
 	var fullTokens []int32
 
+	// Gemma 4 IT models require a BOS token at the beginning of the prompt
+	fullTokens = append(fullTokens, 2)
+
+	// Check if thinking mode is requested anywhere in the conversation
+	thinking := false
+	for _, t := range turns {
+		if t.ThinkingEnabled {
+			thinking = true
+			break
+		}
+	}
+
+	// Trigger Thinking Mode if requested.
+	// Per official spec, <|think|> must be at the start of the system prompt.
+	if thinking {
+		t1, _ := b.tokenizer.Encode("<|turn>system\n<|think|><turn|>\n", false)
+		fullTokens = append(fullTokens, t1...)
+	}
+
 	for i, turn := range turns {
 		// Turn Start: <|turn>role\n
-		turnHeader := fmt.Sprintf("<|turn>%s\n", turn.Role)
-		tokens, err := b.tokenizer.Encode(turnHeader, false)
+		// To prevent shattering, we encode the structural marker atomically
+		t1, err := b.tokenizer.Encode("<|turn>", false)
 		if err != nil {
 			return nil, nil, err
 		}
-		fullTokens = append(fullTokens, tokens...)
+		t2, err := b.tokenizer.Encode(turn.Role+"\n", false)
+		if err != nil {
+			return nil, nil, err
+		}
+		fullTokens = append(fullTokens, append(t1, t2...)...)
 
 		for _, comp := range turn.Components {
 			compTokens, err := b.encodeComponent(comp)
@@ -296,7 +403,7 @@ func (b *GTRPromptBuilder) Build(ctx context.Context, turns []api.GTRChatTurn) (
 		// but the request might provide historical turns that DO have it.
 		// For the last turn, if it's a model turn, we skip <turn|> to allow continuation.
 		if i < len(turns)-1 || turn.Role != "model" {
-			tokens, err = b.tokenizer.Encode("<turn|>", false)
+			tokens, err := b.tokenizer.Encode("<turn|>\n", false)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -304,13 +411,11 @@ func (b *GTRPromptBuilder) Build(ctx context.Context, turns []api.GTRChatTurn) (
 		}
 	}
 
-	// Ensure model turn start if the last turn was not a model turn? 
-	// Or let the client provide the start of the model turn.
-	// Actually, the prompt should end with the start of the model turn for the next generation.
-	// If the last turn role is NOT "model", we should probably append a model turn start.
+	// Ensure model turn start if the last turn was not a model turn
 	if len(turns) > 0 && turns[len(turns)-1].Role != "model" {
-		tokens, _ := b.tokenizer.Encode("<|turn>model\n", false)
-		fullTokens = append(fullTokens, tokens...)
+		t1, _ := b.tokenizer.Encode("<|turn>", false)
+		t2, _ := b.tokenizer.Encode("model\n", false)
+		fullTokens = append(fullTokens, append(t1, t2...)...)
 	}
 
 	res := make([]int, len(fullTokens))
@@ -321,11 +426,11 @@ func (b *GTRPromptBuilder) Build(ctx context.Context, turns []api.GTRChatTurn) (
 }
 
 // SafeDetokenize decodes tokens but replaces our protected image token ID (258880)
-// with the [img-N] tags expected by the runner. This prevents literal text in 
+// with the [img-N] tags expected by the runner. This prevents literal text in
 // components from being misinterpreted as image markers.
 func (b *GTRPromptBuilder) SafeDetokenize(ctx context.Context, r llm.LlamaServer, tokens []int) (string, error) {
-	// With the new token pass-through runner, we no longer need to perform 
-	// special detokenization for image placement. We return a standard 
+	// With the new token pass-through runner, we no longer need to perform
+	// special detokenization for image placement. We return a standard
 	// detokenized string for logging and debugging purposes.
 	return r.Detokenize(ctx, tokens)
 }
@@ -340,7 +445,7 @@ var ALL_STRUCTURAL = []string{
 
 func (b *GTRPromptBuilder) encodeComponent(comp api.GTRChatComponent) ([]int32, error) {
 	switch comp.CType {
-	case "systemtext", "answer", "thinking":
+	case "system_text", "answer", "thinking":
 		var data api.GTRTextData
 		if err := json.Unmarshal(comp.Data, &data); err != nil {
 			return nil, err
@@ -355,108 +460,316 @@ func (b *GTRPromptBuilder) encodeComponent(comp api.GTRChatComponent) ([]int32, 
 		}
 		return b.tokenizer.EncodeWithAllowed(data.Text, false, []string{})
 
-	case "toolschema":
-		var data api.GTRToolSchemaData
-		if err := json.Unmarshal(comp.Data, &data); err != nil {
-			return nil, err
-		}
-		var tokens []int32
-		for _, tool := range data.Tools {
-			t1, _ := b.tokenizer.Encode("<|tool>", false)
-			// Encode tool JSON schema or simplified format
-			// The requirements say for toolschema, values are encoded with allowedTokens: []
-			// Framing is raw IDs.
-			// Simplified framing for example: call:name{...}
-			// But for schema, it's different. Let's use a generic JSON-like framing.
-			schemaStr := fmt.Sprintf("{\"name\": \"%s\", \"description\": \"%s\"}", tool.Name, tool.Description)
-			t2, _ := b.tokenizer.EncodeWithAllowed(schemaStr, false, []string{}) 
-			t3, _ := b.tokenizer.Encode("<tool|>", false)
-			tokens = append(append(append(tokens, t1...), t2...), t3...)
-		}
-		return tokens, nil
-
-	case "toolcall":
+	case "toolcall", "tool_call":
 		var data api.GTRToolCallData
 		if err := json.Unmarshal(comp.Data, &data); err != nil {
 			return nil, err
 		}
-		// <|tool_call>call:name{key:<|"|>val<|"|>,...}<tool_call|>
-		t1, _ := b.tokenizer.Encode("<|tool_call>", false)
-		t2, _ := b.tokenizer.EncodeWithAllowed(fmt.Sprintf("call:%s{", data.Name), false, ALL_STRUCTURAL)
-		tokens := append(t1, t2...)
+
+		// Structure: <|tool_call>call:name{key:<|"|>val<|"|>,...}<tool_call|>
+		t1, _ := b.tokenizer.Encode("<|tool_call>call:", false)
+		t2, _ := b.tokenizer.EncodeWithAllowed(data.Name, false, []string{}) // Safe tool name
+		t3, _ := b.tokenizer.Encode("{", false)
+		tokens := append(append(t1, t2...), t3...)
+
+		qTok, _ := b.tokenizer.Encode("<|\"|>", false)
+
 		for i, arg := range data.Args {
 			if i > 0 {
-				sep, _ := b.tokenizer.EncodeWithAllowed(",", false, ALL_STRUCTURAL)
+				sep, _ := b.tokenizer.Encode(",", false)
 				tokens = append(tokens, sep...)
 			}
-			k, _ := b.tokenizer.EncodeWithAllowed(arg.Key, false, []string{})
-			c, _ := b.tokenizer.EncodeWithAllowed(":", false, []string{})
+			k, _ := b.tokenizer.EncodeWithAllowed(arg.Key, false, []string{}) // Safe key
+			c, _ := b.tokenizer.Encode(":", false)
 			tokens = append(append(tokens, k...), c...)
-			
-			q1, _ := b.tokenizer.Encode("<|\"|>", false)
-			v, _ := b.tokenizer.EncodeWithAllowed(arg.Val, false, []string{})
-			q2, _ := b.tokenizer.Encode("<|\"|>", false)
-			tokens = append(append(append(tokens, q1...), v...), q2...)
-		}
-		endBrace, _ := b.tokenizer.EncodeWithAllowed("}", false, ALL_STRUCTURAL)
-		tEnd, _ := b.tokenizer.Encode("<tool_call|>", false)
-		return append(append(tokens, endBrace...), tEnd...), nil
 
-	case "tool_response":
-		var data api.GTRToolCallData // Reuse toolcall shape for response result
+			v, _ := b.tokenizer.EncodeWithAllowed(arg.Val, false, []string{}) // Safe value
+			tokens = append(append(append(tokens, qTok...), v...), qTok...)
+		}
+
+		closeBrace, _ := b.tokenizer.Encode("}", false)
+		tEnd, _ := b.tokenizer.Encode("<tool_call|>", false)
+		return append(append(tokens, closeBrace...), tEnd...), nil
+
+	case "toolresponse", "tool_response":
+		var data api.GTRToolCallData
 		if err := json.Unmarshal(comp.Data, &data); err != nil {
 			return nil, err
 		}
-		t1, _ := b.tokenizer.Encode("<|tool_response>", false)
-		// Assuming tool response follows a similar pattern or just raw result
-		t2, _ := b.tokenizer.EncodeWithAllowed(fmt.Sprintf("{\"%s\": ", data.Name), false, []string{})
-		tokens := append(t1, t2...)
-		q1, _ := b.tokenizer.Encode("<|\"|>", false)
-		// The result is usually in data.Args[0].Val if we follow the weather example
-		val := ""
-		if len(data.Args) > 0 { val = data.Args[0].Val }
-		v, _ := b.tokenizer.EncodeWithAllowed(val, false, []string{})
-		q2, _ := b.tokenizer.Encode("<|\"|>", false)
-		t3, _ := b.tokenizer.EncodeWithAllowed("}", false, []string{})
-		tEnd, _ := b.tokenizer.Encode("<tool_response|>", false)
-		return append(append(append(append(append(tokens, q1...), v...), q2...), t3...), tEnd...), nil
+
+		// Structure: <|tool_response>response:name{key:<|"|>val<|"|>,...}<tool_response|>
+		t1, _ := b.tokenizer.Encode("<|tool_response>response:", false)
+		t2, _ := b.tokenizer.EncodeWithAllowed(data.Name, false, []string{})
+		t3, _ := b.tokenizer.Encode("{", false)
+		tokens := append(append(t1, t2...), t3...)
+
+		qTok, _ := b.tokenizer.Encode("<|\"|>", false)
+
+		for i, arg := range data.Args {
+			if i > 0 {
+				sep, _ := b.tokenizer.Encode(",", false)
+				tokens = append(tokens, sep...)
+			}
+			k, _ := b.tokenizer.EncodeWithAllowed(arg.Key, false, []string{})
+			c, _ := b.tokenizer.Encode(":", false)
+			tokens = append(append(tokens, k...), c...)
+
+			// Assume all the response results in our demo are strings for now,
+			// though the spec allows numbers etc.
+			v, _ := b.tokenizer.EncodeWithAllowed(arg.Val, false, []string{})
+			tokens = append(append(append(tokens, qTok...), v...), qTok...)
+		}
+
+		tEnd, _ := b.tokenizer.Encode("}<tool_response|>", false)
+		return append(tokens, tEnd...), nil
 
 	case "image":
 		var data api.GTRMultimodalData
 		if err := json.Unmarshal(comp.Data, &data); err != nil {
 			return nil, err
 		}
-		// We use the official <|image|> structural token ID (258880) as a marker.
-		// Since user text is encoded with allowedTokens=[], the tokenizer will 
-		// never produce this ID from user-provided string content, making it 
-		// a safe and unambiguous placeholder.
 		imgData, err := base64.StdEncoding.DecodeString(data.Multimodal)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decode image base64: %v", err)
 		}
 		b.images = append(b.images, llm.ImageData{Data: imgData})
-		
 		return []int32{258880}, nil
 
-	case "tool":
+	case "toolschema", "tool_schema":
+		var wrapper struct {
+			Tools []gemmaTool `json:"tools"`
+		}
+		if err := json.Unmarshal(comp.Data, &wrapper); err != nil {
+			return nil, err
+		}
+
+		var tokens []int32
+		for i, t := range wrapper.Tools {
+			if i > 0 {
+				nl, _ := b.tokenizer.Encode("\n", false)
+				tokens = append(tokens, nl...)
+			}
+			tokens = append(tokens, formatGemmaFunctionDeclarationTokens(b.tokenizer, t)...)
+		}
+
 		start, _ := b.tokenizer.Encode("<|tool>", false)
-		content, _ := b.tokenizer.EncodeWithAllowed(string(comp.Data), false, []string{})
 		end, _ := b.tokenizer.Encode("<tool|>", false)
-		return append(append(start, content...), end...), nil
-
-	case "call":
-		start, _ := b.tokenizer.Encode("<|call>", false)
-		content, _ := b.tokenizer.EncodeWithAllowed(string(comp.Data), false, []string{})
-		end, _ := b.tokenizer.Encode("<call|>", false)
-		return append(append(start, content...), end...), nil
-
-	case "response":
-		start, _ := b.tokenizer.Encode("<|tool_response>", false)
-		content, _ := b.tokenizer.EncodeWithAllowed(string(comp.Data), false, []string{})
-		end, _ := b.tokenizer.Encode("<tool_response|>", false)
-		return append(append(start, content...), end...), nil
+		return append(append(start, tokens...), end...), nil
 
 	default:
 		return nil, fmt.Errorf("unsupported component type: %s", comp.CType)
 	}
+}
+
+type gemmaTool struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name        string                 `json:"name"`
+		Description string                 `json:"description"`
+		Parameters  map[string]interface{} `json:"parameters"`
+	} `json:"function"`
+}
+
+func formatGemmaFunctionDeclarationTokens(tok tokenizer.Tokenizer, tool gemmaTool) []int32 {
+	var tokens []int32
+
+	// declaration:name{
+	t, _ := tok.Encode("declaration:", false)
+	tokens = append(tokens, t...)
+	t, _ = tok.EncodeWithAllowed(tool.Function.Name, false, []string{})
+	tokens = append(tokens, t...)
+	t, _ = tok.Encode("{\n", false)
+	tokens = append(tokens, t...)
+
+	qTok, _ := tok.Encode("<|\"|>", false)
+
+	if tool.Function.Description != "" {
+		t, _ = tok.Encode("    description:", false)
+		tokens = append(tokens, t...)
+		tokens = append(tokens, qTok...)
+		t, _ = tok.EncodeWithAllowed(tool.Function.Description, false, []string{})
+		tokens = append(tokens, t...)
+		tokens = append(tokens, qTok...)
+		t, _ = tok.Encode(",\n", false)
+		tokens = append(tokens, t...)
+	}
+
+	params := tool.Function.Parameters
+	if params != nil {
+		t, _ = tok.Encode("    parameters:{\n", false)
+		tokens = append(tokens, t...)
+
+		if props, ok := params["properties"].(map[string]interface{}); ok {
+			var nReq []string
+			if nr, ok := params["required"].([]interface{}); ok {
+				for _, r := range nr {
+					nReq = append(nReq, fmt.Sprint(r))
+				}
+			}
+			t, _ = tok.Encode("        properties:{\n", false)
+			tokens = append(tokens, t...)
+			tokens = append(tokens, formatGemmaParametersTokens(tok, props, nReq, 2)...)
+			t, _ = tok.Encode("\n        }", false)
+			tokens = append(tokens, t...)
+		}
+
+		if req, ok := params["required"].([]interface{}); ok && len(req) > 0 {
+			t, _ = tok.Encode("},required:[", false)
+			tokens = append(tokens, t...)
+			for i, r := range req {
+				if i > 0 {
+					t, _ = tok.Encode(",", false)
+					tokens = append(tokens, t...)
+				}
+				tokens = append(tokens, qTok...)
+				t, _ = tok.EncodeWithAllowed(fmt.Sprint(r), false, []string{})
+				tokens = append(tokens, t...)
+				tokens = append(tokens, qTok...)
+			}
+			t, _ = tok.Encode("],type:<|\"|>OBJECT<|\"|> }", false)
+			tokens = append(tokens, t...)
+		} else {
+			t, _ = tok.Encode("},type:<|\"|>OBJECT<|\"|> }", false)
+			tokens = append(tokens, t...)
+		}
+
+		t, _ = tok.Encode("\n    }", false)
+		tokens = append(tokens, t...)
+	}
+
+	t, _ = tok.Encode("\n}", false)
+	return append(tokens, t...)
+}
+
+func formatGemmaParametersTokens(tok tokenizer.Tokenizer, props map[string]interface{}, required []string, depth int) []int32 {
+	indent := strings.Repeat("    ", depth+1)
+	var tokens []int32
+
+	keys := make([]string, 0, len(props))
+	for k := range props {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	qTok, _ := tok.Encode("<|\"|>", false)
+
+	for i, key := range keys {
+		if i > 0 {
+			t, _ := tok.Encode(",\n", false)
+			tokens = append(tokens, t...)
+		}
+
+		val, ok := props[key].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		t, _ := tok.Encode(indent, false)
+		tokens = append(tokens, t...)
+		t, _ = tok.EncodeWithAllowed(key, false, []string{})
+		tokens = append(tokens, t...)
+		t, _ = tok.Encode(":{", false)
+		tokens = append(tokens, t...)
+
+		first := true
+		if desc, ok := val["description"].(string); ok {
+			t, _ = tok.Encode("description:", false)
+			tokens = append(tokens, t...)
+			tokens = append(tokens, qTok...)
+			t, _ = tok.EncodeWithAllowed(desc, false, []string{})
+			tokens = append(tokens, t...)
+			tokens = append(tokens, qTok...)
+			first = false
+		}
+
+		typeStr := ""
+		if t, ok := val["type"].(string); ok {
+			typeStr = strings.ToUpper(t)
+		}
+
+		if typeStr == "OBJECT" {
+			if !first {
+				t, _ = tok.Encode(",", false)
+				tokens = append(tokens, t...)
+			}
+			if nested, ok := val["properties"].(map[string]interface{}); ok {
+				var nReq []string
+				if nr, ok := val["required"].([]interface{}); ok {
+					for _, r := range nr {
+						nReq = append(nReq, fmt.Sprint(r))
+					}
+				}
+				t, _ = tok.Encode("properties:{\n", false)
+				tokens = append(tokens, t...)
+				tokens = append(tokens, formatGemmaParametersTokens(tok, nested, nReq, depth+1)...)
+				t, _ = tok.Encode(fmt.Sprintf("\n%s}", indent), false)
+				tokens = append(tokens, t...)
+				first = false
+			}
+		}
+
+		if typeStr != "" {
+			if !first {
+				t, _ = tok.Encode(",", false)
+				tokens = append(tokens, t...)
+			}
+			t, _ = tok.Encode("type:", false)
+			tokens = append(tokens, t...)
+			tokens = append(tokens, qTok...)
+			t, _ = tok.EncodeWithAllowed(typeStr, false, []string{})
+			tokens = append(tokens, t...)
+			tokens = append(tokens, qTok...)
+		}
+
+		t, _ = tok.Encode("}", false)
+		tokens = append(tokens, t...)
+	}
+
+	return tokens
+}
+
+func parseGemma4ToolCall(s string) *api.GTRToolCallData {
+	res := &api.GTRToolCallData{}
+	s = strings.TrimSpace(s)
+
+	// Gemma4 usually output starts with "call:name{"
+	// We'll look for the first colon and the first brace
+	colonIdx := strings.Index(s, ":")
+	braceIdx := strings.Index(s, "{")
+
+	if colonIdx != -1 && (braceIdx == -1 || colonIdx < braceIdx) {
+		// Verify if the prefix is indeed "call" (case-insensitive)
+		prefix := strings.ToLower(strings.TrimSpace(s[:colonIdx]))
+		if prefix == "call" {
+			s = s[colonIdx+1:]
+			braceIdx = strings.Index(s, "{")
+		}
+	}
+
+	if braceIdx == -1 {
+		res.Name = strings.TrimSpace(s)
+		return res
+	}
+
+	res.Name = strings.TrimSpace(s[:braceIdx])
+	argsStr := s[braceIdx+1:]
+	if strings.HasSuffix(argsStr, "}") {
+		argsStr = argsStr[:len(argsStr)-1]
+	}
+
+	// Split by comma
+	parts := strings.Split(argsStr, ",")
+	for _, p := range parts {
+		kv := strings.SplitN(p, ":", 2)
+		if len(kv) == 2 {
+			k := strings.TrimSpace(kv[0])
+			v := kv[1]
+			// Clean up structural markers and quotes from value
+			v = strings.ReplaceAll(v, "<|\"|>", "")
+			v = strings.Trim(v, " \t\n\r\"'")
+			res.Args = append(res.Args, api.GTRToolArg{Key: k, Val: v})
+		}
+	}
+
+	return res
 }

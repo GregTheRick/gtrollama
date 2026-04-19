@@ -652,10 +652,10 @@ type GTRChatResponse struct {
 
 // GTRChatResponseEvent is a single event streamed from /api/gtrchat in structured mode.
 type GTRChatResponseEvent struct {
-	Type    string `json:"type"`             // "thinking", "text", "tool_call_start", "tool_call_delta", "tool_call_end", "done"
-	Content string `json:"content,omitempty"`
-	Name    string `json:"name,omitempty"`    // for tool_call_start
-	Status  string `json:"status,omitempty"`  // for done: "complete" or "call_wait"
+	Type     string           `json:"type"` // "thinking", "text", "tool_call", "done"
+	Content  string           `json:"content,omitempty"`
+	ToolCall *GTRToolCallData `json:"tool_call,omitempty"`
+	Status   string           `json:"status,omitempty"` // for done: "complete" or "call_wait"
 }
 
 // Options specified in [GenerateRequest].  If you add a new option here, also

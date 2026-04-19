@@ -272,7 +272,7 @@ func TestGTRPromptBuilder_VisualVerification(t *testing.T) {
 						"type": "function",
 						"function": {
 							"name": "get_weather",
-							"description": "Get current weather for a location",
+							"description": "Get current weather for <|\"|> a location",
 							"parameters": {
 								"type": "object",
 								"properties": {
@@ -307,8 +307,20 @@ func TestGTRPromptBuilder_VisualVerification(t *testing.T) {
 		{
 			Role: "model",
 			Components: []api.GTRChatComponent{
-				{CType: "thinking", Data: []byte(`{"text": "I see a blue ball."}`)},
-				{CType: "answer", Data: []byte(`{"text": "It is a blue ball."}`)},
+				{CType: "thinking", Data: []byte(`{"text": "I will check the weather for San Francisco."}`)},
+				{CType: "call", Data: []byte(`{"name": "get_weather<|\"|>", "args": [{"key": "location", "val": "San<|\"|> Francisco"}]}`)},
+			},
+		},
+		{
+			Role: "tool",
+			Components: []api.GTRChatComponent{
+				{CType: "response", Data: []byte(`{"name": "get_weather<|\"|>", "args": [{"key": "result", "val": "Sunny<|\"|>, 22C"}]}`)},
+			},
+		},
+		{
+			Role: "model",
+			Components: []api.GTRChatComponent{
+				{CType: "answer", Data: []byte(`{"text": "The weather in San Francisco is Sunny, 22C."}`)},
 			},
 		},
 	}
@@ -327,6 +339,67 @@ func TestGTRPromptBuilder_VisualVerification(t *testing.T) {
 	for i, tok := range tokens {
 		piece, _ := builder.tokenizer.Decode([]int32{int32(tok)})
 		t.Logf("%4d: %6d -> %q", i, tok, piece)
+	}
+}
+
+func TestGTRPromptBuilder_TurnInitiationVerification(t *testing.T) {
+	ggufPath, err := findGemma4GGUFForTest()
+	if err != nil {
+		t.Skip("Skipping visual verification: no Gemma 4 model blob found")
+	}
+
+	tok, err := loadGemma4TokenizerForTest(ggufPath)
+	if err != nil {
+		t.Fatalf("failed to load tokenizer: %v", err)
+	}
+
+	builder := &GTRPromptBuilder{tokenizer: tok}
+
+	// Case 1: Prompt ends with User turn -> Should append <|turn>model\n
+	turns := []api.GTRChatTurn{
+		{
+			Role: "user",
+			Components: []api.GTRChatComponent{
+				{CType: "answer", Data: json.RawMessage(`{"text": "Hello!"}`)},
+			},
+		},
+	}
+
+	tokens, _, err := builder.Build(context.Background(), turns)
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+
+	ids := make([]int32, len(tokens))
+	for i, v := range tokens { ids[i] = int32(v) }
+	
+	prompt, _ := tok.Decode(ids)
+	t.Logf("\n--- Detokenized Prompt (Ends with User) ---\n%s\n-----------------------------------------", prompt)
+	
+	lastHeader := "<|turn>model\n"
+	if !strings.HasSuffix(prompt, lastHeader) {
+		t.Errorf("Expected prompt to end with %q, but got %q", lastHeader, prompt[len(prompt)-len(lastHeader):])
+	}
+
+	// Case 2: Prompt ends with Model turn -> Should NOT append another header
+	turns = append(turns, api.GTRChatTurn{
+		Role: "model",
+		Components: []api.GTRChatComponent{
+			{CType: "answer", Data: json.RawMessage(`{"text": "Hi!"}`)},
+		},
+	})
+	
+	tokens, _, err = builder.Build(context.Background(), turns)
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+	ids = make([]int32, len(tokens))
+	for i, v := range tokens { ids[i] = int32(v) }
+	prompt, _ = tok.Decode(ids)
+	t.Logf("\n--- Detokenized Prompt (Ends with Model) ---\n%s\n-----------------------------------------", prompt)
+
+	if strings.Count(prompt, "<|turn>model\n") != 1 {
+		t.Errorf("Expected exactly one model turn header, but found %d", strings.Count(prompt, "<|turn>model\n"))
 	}
 }
 

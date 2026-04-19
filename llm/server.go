@@ -1527,6 +1527,7 @@ type Logprob struct {
 
 type CompletionResponse struct {
 	Content            string        `json:"content"`
+	TokenIDs           []int         `json:"token_ids,omitempty"`
 	DoneReason         DoneReason    `json:"done_reason"`
 	Done               bool          `json:"done"`
 	PromptEvalCount    int           `json:"prompt_eval_count"`
@@ -1664,6 +1665,7 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 			if err := json.Unmarshal(evt, &c); err != nil {
 				return fmt.Errorf("error unmarshalling llm prediction response: %v", err)
 			}
+			slog.Debug("Runner response received", "content", c.Content, "token_ids", c.TokenIDs)
 			switch {
 			case strings.TrimSpace(c.Content) == lastToken:
 				tokenRepeat++
@@ -1678,9 +1680,10 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 				return ctx.Err()
 			}
 
-			if c.Content != "" {
+			if c.Content != "" || len(c.TokenIDs) > 0 {
 				fn(CompletionResponse{
 					Content:  c.Content,
+					TokenIDs: c.TokenIDs,
 					Logprobs: c.Logprobs,
 				})
 			}

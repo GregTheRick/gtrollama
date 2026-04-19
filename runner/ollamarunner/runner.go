@@ -45,6 +45,7 @@ import (
 // response contains a piece of generated text along with optional logprobs
 type response struct {
 	content  string
+	tokenIDs []int32
 	logprobs []llm.Logprob
 }
 
@@ -67,6 +68,7 @@ type Sequence struct {
 
 	// tokens that have been generated but not returned yet (e.g. for stop sequences)
 	pendingResponses []string
+	pendingTokenIDs  []int32
 
 	// logprobs for tokens that haven't been returned yet
 	pendingLogprobs []llm.Logprob
@@ -131,7 +133,7 @@ var errorInputTooLong = errors.New("the input length exceeds the context length"
 
 func (s *Server) NewSequence(prompt string, promptTokens []int, images []llm.ImageData, params NewSequenceParams) (*Sequence, error) {
 	s.ready.Wait()
-	
+
 	inputs, ctxs, mmStore, err := s.inputs(prompt, promptTokens, images)
 	if err != nil {
 		return nil, fmt.Errorf("failed to process inputs: %w", err)
@@ -226,7 +228,7 @@ func (s *Server) inputs(prompt string, promptTokens []int, images []llm.ImageDat
 	var inputs []*input.Input
 	var ctxs []ml.Context
 	var mmStore multimodalStore
-	
+
 	multimodalProcessor, visionModel := s.model.(model.MultimodalProcessor)
 	if visionModel {
 		mmStore = newMultimodalStore()
@@ -237,11 +239,10 @@ func (s *Server) inputs(prompt string, promptTokens []int, images []llm.ImageDat
 		// We look for the official image token ID in the model's vocabulary
 		var imageTokenID int32 = -1
 		tok := s.model.(tokenizer.Tokenizer)
-		for i := 0; i < 300000; i++ { // Typical vocab size
-			if tok.Is(int32(i), tokenizer.Special("<|image>")) || tok.Is(int32(i), tokenizer.Special("<|image|>")) {
-				imageTokenID = int32(i)
-				break
-			}
+		if ids, err := tok.Encode("<|image|>", false); err == nil && len(ids) == 1 {
+			imageTokenID = ids[0]
+		} else if ids, err := tok.Encode("<|image>", false); err == nil && len(ids) == 1 {
+			imageTokenID = ids[0]
 		}
 
 		imgIdx := 0
@@ -250,16 +251,16 @@ func (s *Server) inputs(prompt string, promptTokens []int, images []llm.ImageDat
 				ctx := s.model.Backend().NewContext()
 				runtime.SetFinalizer(ctx, func(c ml.Context) { c.Close() })
 				ctxs = append(ctxs, ctx)
-				
+
 				imageEmbeddings, err := multimodalProcessor.EncodeMultimodal(ctx, images[imgIdx].Data)
 				if err != nil {
 					return nil, nil, nil, err
 				}
-				
+
 				s.multimodalHash.Reset()
 				_, _ = s.multimodalHash.Write(images[imgIdx].Data)
 				imageHash := s.multimodalHash.Sum64()
-				
+
 				mmStore.addMultimodal(imageEmbeddings)
 				inputs = append(inputs, &input.Input{Multimodal: imageEmbeddings, MultimodalHash: imageHash})
 				imgIdx++
@@ -272,7 +273,7 @@ func (s *Server) inputs(prompt string, promptTokens []int, images []llm.ImageDat
 		re := regexp.MustCompile(`\[img-(\d+)\]`)
 		parts := re.Split(prompt, -1)
 		matches := re.FindAllStringSubmatch(prompt, -1)
-		
+
 		for i, part := range parts {
 			// text - tokenize
 			tokens, err := s.model.(tokenizer.Tokenizer).Encode(part, i == 0)
@@ -282,7 +283,7 @@ func (s *Server) inputs(prompt string, promptTokens []int, images []llm.ImageDat
 			for _, t := range tokens {
 				inputs = append(inputs, &input.Input{Token: t})
 			}
-			
+
 			// image - decode and store
 			if i < len(matches) {
 				n, _ := strconv.Atoi(matches[i][1])
@@ -293,24 +294,24 @@ func (s *Server) inputs(prompt string, promptTokens []int, images []llm.ImageDat
 						break
 					}
 				}
-				
+
 				if imageIndex < 0 {
 					return nil, nil, nil, fmt.Errorf("invalid image index: %d", n)
 				}
-				
+
 				ctx := s.model.Backend().NewContext()
 				runtime.SetFinalizer(ctx, func(c ml.Context) { c.Close() })
 				ctxs = append(ctxs, ctx)
-				
+
 				imageEmbeddings, err := multimodalProcessor.EncodeMultimodal(ctx, images[imageIndex].Data)
 				if err != nil {
 					return nil, nil, nil, err
 				}
-				
+
 				s.multimodalHash.Reset()
 				_, _ = s.multimodalHash.Write(images[imageIndex].Data)
 				imageHash := s.multimodalHash.Sum64()
-				
+
 				mmStore.addMultimodal(imageEmbeddings)
 				inputs = append(inputs, &input.Input{Multimodal: imageEmbeddings, MultimodalHash: imageHash})
 			}
@@ -442,6 +443,14 @@ func flushPending(seq *Sequence) bool {
 	seq.pendingResponses = []string{}
 	seq.pendingLogprobs = []llm.Logprob{}
 
+	resp := response{content: joined}
+	if seq.logprobs {
+		resp.logprobs = logprobs
+	}
+
+	resp.tokenIDs = append([]int32{}, seq.pendingTokenIDs...)
+	seq.pendingTokenIDs = []int32{}
+
 	// Check if there are any partial UTF-8 characters remaining.
 	// We already check and queue as we are generating but some may
 	// still make it here:
@@ -452,12 +461,12 @@ func flushPending(seq *Sequence) bool {
 		joined = joined[:len(joined)-1]
 	}
 
-	if len(joined) == 0 {
+	if len(joined) == 0 && len(resp.tokenIDs) == 0 {
 		return true
 	}
 
 	select {
-	case seq.responses <- response{content: joined, logprobs: logprobs}:
+	case seq.responses <- resp:
 		return true
 	case <-seq.quit:
 		return false
@@ -826,6 +835,7 @@ func (s *Server) computeBatch(activeBatch batchState) {
 		}
 
 		seq.pendingResponses = append(seq.pendingResponses, piece)
+		seq.pendingTokenIDs = append(seq.pendingTokenIDs, token)
 
 		// if past the num predict limit
 		if seq.numPredict > 0 && seq.numPredicted >= seq.numPredict {
@@ -999,8 +1009,13 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 			return
 		case resp, ok := <-seq.responses:
 			if ok {
+				ids := make([]int, len(resp.tokenIDs))
+				for i, id := range resp.tokenIDs {
+					ids[i] = int(id)
+				}
 				if err := json.NewEncoder(w).Encode(&llm.CompletionResponse{
 					Content:  resp.content,
+					TokenIDs: ids,
 					Logprobs: resp.logprobs,
 				}); err != nil {
 					http.Error(w, fmt.Sprintf("failed to encode response: %v", err), http.StatusInternalServerError)
@@ -1010,14 +1025,26 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 
 				flusher.Flush()
 			} else {
-				if err := json.NewEncoder(w).Encode(&llm.CompletionResponse{
+				// Flush any remaining artifacts
+				resp := llm.CompletionResponse{
 					Done:               true,
 					DoneReason:         seq.doneReason,
 					PromptEvalCount:    seq.numPromptInputs,
 					PromptEvalDuration: seq.processingDuration,
 					EvalCount:          seq.numPredicted,
 					EvalDuration:       seq.lastUpdatedAt.Sub(seq.startedAt) - seq.samplingDuration,
-				}); err != nil {
+				}
+
+				if len(seq.pendingResponses) > 0 {
+					resp.Content = strings.Join(seq.pendingResponses, "")
+					ids := make([]int, len(seq.pendingTokenIDs))
+					for i, id := range seq.pendingTokenIDs {
+						ids[i] = int(id)
+					}
+					resp.TokenIDs = ids
+				}
+
+				if err := json.NewEncoder(w).Encode(&resp); err != nil {
 					http.Error(w, fmt.Sprintf("failed to encode final response: %v", err), http.StatusInternalServerError)
 				}
 
